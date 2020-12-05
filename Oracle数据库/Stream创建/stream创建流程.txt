@@ -1,0 +1,194 @@
+1、在目端建到源库的db_link
+conn strmadmin/strmadmin@target;
+
+create database link strm_link connect to strmadmin identified by strmadmin using 'target';
+
+2、在目端建到源库的db_link
+conn strmadmin/strmadmin@target;
+
+create database link test connect to strmadmin identified by strmadmin using 'source';
+
+3、最初的用户复制
+分别在源库和目标数据库上创建测试用户
+create user dave identified by dave;
+grant dba to dave;
+
+4、在源数据库上创建Source队列
+connect strmadmin/strmadmin@source;
+
+BEGIN
+DBMS_STREAMS_ADM.SET_UP_QUEUE(
+queue_table =>'SOURCE_QUEUE_TABLE',-队列表
+queue_name =>'SOURCE_QUEUE',-队列
+queue_user =>'strmadmin'); -队列用户
+END；
+/
+
+
+5、在目标数据库DBA2上创建接收队列
+connect strmadmin/strmadmin@target;
+
+BEGIN
+DBMS_STREAMS_ADM.SET_UP_QUEUE(
+queue_table =>'SOURCE_QUEUE_TABLE',-队列表
+queue_name =>'SOURCE_QUEUE',-队列
+queue_user =>'strmadmin'); -队列用户
+END；
+/
+
+可以用查询dba_queues,dba_queue_tables来检查：
+select owner,queue_table,name from dba_queues where owner='STRMADMIN';
+
+
+6、在源数据库上创建capture进程
+conn strmadmin/strmadmin@source;
+
+BEGIN
+DBMS_STREAMS_ADM.ADD_SCHEMA_RULES(
+schema_name=>'dave',--用户名，如dave，非sys或system
+streams_type=>'capture',
+streams_name=>'capture_stream',
+queue_name=>'strmadmin.SOURCE_QUEUE',
+include_dml=>true,
+include_ddl=>true,
+source_database=>'ORCL',
+include_tagged_lcr=>false,
+inclusion_rule=>true);
+END;
+/
+
+可以通过dba_capture查看
+select CAPTURE_NAME,QUEUE_NAME,START_SCN,STATUS,CAPTURE_TYPE from dba_capture;
+
+
+7、在源数据库上创建传播进程
+conn strmadmin/strmadmin@source;
+
+BEGIN
+DBMS_STREAMS_ADM.ADD_SCHEMA_PROPAGATION_RULES(
+schema_name=>'dave',
+streams_name=>'source_to_target',
+source_queue_name=>'strmadmin.SOURCE_QUEUE',
+destination_queue_name=>'strmadmin.TARGET_QUEUE@strm_link',--此队列待创建
+include_dml=>true,
+include_ddl=>true,
+source_database=>'ORCL',
+inclusion_rule=>true,
+queue_to_queue=>true);
+END;
+/
+
+重新启动propagation process
+--dbms_propagaton_adm.start_propagation(propagation_name)
+--其中propagation_name可以从表all_propagation中取得
+select propagation_name,status from all_propagation;
+
+exec dbms_propagation_adm.start_propagation('SOURCE_TO_TARGET');
+exec dbms_propagation_adm.stop_propagation('SOURCE_TO_TARGET');
+
+BEGIN
+dbms_aqadm.alter_propagation_schedule(
+queue_name=>'SOURCE_QUEUE',
+destination=>'strm_link';
+destination_queue=>'TARGET_QUEUE',
+latency=>0);
+end;
+/
+
+
+
+6、在目标数据库TEST上创建Apply进程
+
+BEGIN
+DBMS_STREAMS_ADM.ADD_SCHEMA_RULES(
+schema_name=>'dave',
+streams_type=>'apply',
+streams_name=>'target_apply_stream',
+queue_name=>'strmadmin.TARGET_QUEUE',
+include_dml=>true,
+include_ddl=>true,
+include_tagged_lcr=>false,
+source_database=>'ORCL',
+inclusion_rule=>true);
+END;
+/
+
+
+7、直接设置SCN的方式进行实例化
+--获取源库互置用户的SCN
+select DBNS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER() from dual;
+
+--设置为目标库互置用户的SCN
+
+BEGIN
+DBMS_APPLY_ADM.SET_SCHEMA_INSTANTIATION_SCN(
+source_schema_name=>'DAVE',
+source_database_name=>'ORCL',
+instantiation_scn=>3493371);
+END;
+/
+
+
+8、在目标数据库上启动apply进程
+BEGIN
+DBMS_APPLY_ADM.START_APPLY(
+apply_name=>'target_apply_stream');
+END;
+/
+
+
+停止Apply进程
+begin
+dbms_apply_adm.stop_apply(
+apply_name=>'target_apply_stream');
+end;
+/
+
+查看状态
+select apply_name,queue_name,status from dba_apply;
+
+
+9、在源数据库上启动capture
+aonnect strmadmin/strmadmin@SOURCE
+
+BEGIN
+dbms_capture_adm.start_capture(
+capture_name=>'capture_stream');
+END;
+/
+
+
+10、命令清理
+select owner,queue_table,name from dba_queues where owner='STRMADMIN';
+select capture_name,queue_name,rule_set_name,negative_rule_set_name,status from dba_capture;
+
+select propagation_name,source_queue_name,destination_queue_name,destination_dblink,status from dba_propagation;
+select capture_name,queue_name,status,captured_scn,applied_scn,applied_scn from dba_capture;
+
+
+select apply_name,error_number,apply_captured,status from dba_apply;
+select queue_name,error_number,error_message,error_creation_time from dba_apply_error;
+
+清除：
+清除源端：
+exec dbms_streams_adm.remove_queue(queue_name=>'SOURCE_QUEUE',cascade=>true,drop_unused_queue_table=>true);
+
+
+清除目标端：
+exec dbms_apply_adm.stop_apply(apply_name=>'target_apply_stream');
+exec dbms_apply_adm.delete_all_errors(apply_name=>'target_apply_stream');
+exec dbms_apply_adm.drop_apply(apply_name=>'target_apply_stream');
+exec dbms_streams_adm.remove_queue(queue_name=>'TARGET_QUEUE',cascade=>true,drop_unused_queue_table=>true);
+
+
+
+
+
+
+
+
+
+
+
+
+
